@@ -10,21 +10,26 @@ from skimage.segmentation import mark_boundaries
 from skimage.filters import threshold_otsu, threshold_local
 from sklearn.mixture import GaussianMixture
 from scipy.ndimage import label
-from io import BytesIO
-import tempfile
 import pandas as pd
-
+import tempfile
+import os
 
 class ImageQualityComparator:
     def __init__(self):
         self.reference_image = None
         self.degraded_image = None
         self.segmentation_masks = {}
+
+    def load_image(self, uploaded_file):
+        """Load image from uploaded file"""
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-    def load_images(self, reference_path, degraded_path):
+    def load_images(self, reference_file, degraded_file):
         """Load reference and degraded images"""
-        self.reference_image = cv2.cvtColor(cv2.imread(reference_path), cv2.COLOR_BGR2RGB)
-        self.degraded_image = cv2.cvtColor(cv2.imread(degraded_path), cv2.COLOR_BGR2RGB)
+        self.reference_image = self.load_image(reference_file)
+        self.degraded_image = self.load_image(degraded_file)
         
         if self.reference_image is None or self.degraded_image is None:
             raise ValueError("Could not load one or both images")
@@ -111,6 +116,32 @@ class ImageQualityComparator:
             hsv[:,:,2] = hsv[:,:,2] * 1.1  # Adjust brightness
             hsv = np.clip(hsv, 0, 255)
             processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+            
+        elif method == "hist_global":
+            # Global Histogram Equalization
+            processed = cv2.cvtColor(processed, cv2.COLOR_RGB2YUV)
+            processed[:,:,0] = cv2.equalizeHist(processed[:,:,0])
+            processed = cv2.cvtColor(processed, cv2.COLOR_YUV2RGB)
+            
+        elif method == "hist_adaptive":
+            # Adaptive Histogram Equalization
+            processed = cv2.cvtColor(processed, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(processed)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            cl = clahe.apply(l)
+            processed = cv2.merge((cl,a,b))
+            processed = cv2.cvtColor(processed, cv2.COLOR_LAB2RGB)
+            
+        elif method == "hist_contrast_limited":
+            # Contrast Limited Adaptive Histogram Equalization (CLAHE)
+            processed = exposure.equalize_adapthist(processed, clip_limit=0.03) * 255
+            processed = processed.astype(np.uint8)
+            
+        elif method == "gamma_correction":
+            # Gamma Correction
+            gamma = 1.5  # Adjust gamma value as needed
+            processed = np.power(processed / 255.0, gamma) * 255.0
+            processed = processed.astype(np.uint8)
             
         return processed.astype(np.uint8)
 
@@ -207,177 +238,23 @@ class ImageQualityComparator:
                 plt.axis('off')
             
             plt.tight_layout()
-            plt.show()
-
-    def evaluate_quality(self, reference, test_image):
-        """Calculate various quality metrics"""
-        reference = np.asarray(reference, dtype=np.uint8)
-        test_image = np.asarray(test_image, dtype=np.uint8)
-        
-        reference_gray = cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)
-        test_gray = cv2.cvtColor(test_image, cv2.COLOR_RGB2GRAY)
-            
-        metrics = {
-            'PSNR': self.calculate_psnr(reference, test_image),
-            'SSIM': ssim(reference_gray, test_gray, data_range=255),
-            'MSE': np.mean((reference.astype(float) - test_image.astype(float)) ** 2),
-            'MAE': np.mean(np.abs(reference.astype(float) - test_image.astype(float)))
-        }
-        return metrics
-
-    def calculate_psnr(self, reference, test_image):
-        """Calculate PSNR"""
-        mse = np.mean((reference.astype(float) - test_image.astype(float)) ** 2)
-        if mse == 0:
-            return float('inf')
-        max_pixel = 255.0
-        psnr = 20 * log10(max_pixel / sqrt(mse))
-        return psnr
-
-    def compare_improvements(self, processing_method="contrast_sharp"):
-        """Compare quality before and after processing"""
-        processed_image = self.process_image(self.degraded_image, method=processing_method)
-        degraded_metrics = self.evaluate_quality(self.reference_image, self.degraded_image)
-        processed_metrics = self.evaluate_quality(self.reference_image, processed_image)
-        
-        improvements = {}
-        for metric in degraded_metrics.keys():
-            if metric in ['PSNR', 'SSIM']:
-                improvements[metric] = ((processed_metrics[metric] - degraded_metrics[metric]) / 
-                                     degraded_metrics[metric] * 100)
-            else:
-                improvements[metric] = ((degraded_metrics[metric] - processed_metrics[metric]) / 
-                                     degraded_metrics[metric] * 100)
-        
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        
-        axes[0].imshow(self.reference_image)
-        axes[0].set_title('Reference Image')
-        axes[0].axis('off')
-        
-        axes[1].imshow(self.degraded_image)
-        axes[1].set_title('Degraded Image')
-        axes[1].axis('off')
-        
-        axes[2].imshow(processed_image)
-        axes[2].set_title(f'Processed Image\n({processing_method} method)')
-        axes[2].axis('off')
-        
-        plt.tight_layout()
-        plt.show()
-        
-        print("\nQuality Metrics Comparison:")
-        print("\nDegraded Image Metrics:")
-        for metric, value in degraded_metrics.items():
-            print(f"{metric}: {value:.3f}")
-            
-        print("\nProcessed Image Metrics:")
-        for metric, value in processed_metrics.items():
-            print(f"{metric}: {value:.3f}")
-            
-        print("\nImprovements:")
-        for metric, improvement in improvements.items():
-            print(f"{metric}: {improvement:+.2f}%")
-            
-        return processed_image, degraded_metrics, processed_metrics, improvements
-
-    def process_and_segment(self, processing_method="contrast_sharp", segmentation_method="all"):
-        """Process image and perform segmentation"""
-        processed_image = self.process_image(self.degraded_image, method=processing_method)
-        original_segments = self.segment_objects(self.degraded_image, method=segmentation_method)
-        processed_segments = self.segment_objects(processed_image, method=segmentation_method)
-        
-        plt.figure(figsize=(15, 5))
-        
-        plt.subplot(131)
-        plt.imshow(self.degraded_image)
-        plt.title('Original Image')
-        plt.axis('off')
-        
-        plt.subplot(132)
-        plt.imshow(processed_image)
-        plt.title(f'Processed Image\n({processing_method})')
-        plt.axis('off')
-        
-        if 'slic' in processed_segments:
-            plt.subplot(133)
-            plt.imshow(processed_segments['slic'])
-            plt.title('Segmentation Result\n(SLIC)')
-            plt.axis('off')
-        
-        plt.tight_layout()
-        plt.show()
-        
-        return processed_image, original_segments, processed_segments
-    def process_image(self, image, method="basic"):
-        """Apply various image processing methods"""
-        processed = image.copy()
-        
-        if method == "basic":
-            # Basic enhancement
-            processed = cv2.fastNlMeansDenoisingColored(processed, None, 10, 10, 7, 21)
-            processed = exposure.equalize_adapthist(processed, clip_limit=0.03) * 255
-            processed = processed.astype(np.uint8)
-            
-        elif method == "contrast":
-            # Contrast enhancement
-            lab = cv2.cvtColor(processed, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-            cl = clahe.apply(l)
-            processed = cv2.merge((cl,a,b))
-            processed = cv2.cvtColor(processed, cv2.COLOR_LAB2RGB)
-            
-        elif method == "sharpen":
-            # Sharpening
-            kernel = np.array([[-1,-1,-1],
-                            [-1, 9,-1],
-                            [-1,-1,-1]])
-            processed = cv2.filter2D(processed, -1, kernel)
-            
-        elif method == "hist_global":
-            # Global Histogram Equalization
-            processed = cv2.cvtColor(processed, cv2.COLOR_RGB2YUV)
-            processed[:,:,0] = cv2.equalizeHist(processed[:,:,0])
-            processed = cv2.cvtColor(processed, cv2.COLOR_YUV2RGB)
-            
-        elif method == "hist_adaptive":
-            # Adaptive Histogram Equalization
-            processed = cv2.cvtColor(processed, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(processed)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            cl = clahe.apply(l)
-            processed = cv2.merge((cl,a,b))
-            processed = cv2.cvtColor(processed, cv2.COLOR_LAB2RGB)
-            
-        elif method == "hist_contrast_limited":
-            # Contrast Limited Adaptive Histogram Equalization (CLAHE)
-            processed = exposure.equalize_adapthist(processed, clip_limit=0.03) * 255
-            processed = processed.astype(np.uint8)
-            
-        elif method == "gamma_correction":
-            # Gamma Correction
-            gamma = 1.5  # Adjust gamma value as needed
-            processed = np.power(processed / 255.0, gamma) * 255.0
-            processed = processed.astype(np.uint8)
-            
-        return processed.astype(np.uint8)
+            st.pyplot(plt)
 
     def plot_histogram(self, image, title="Histogram"):
         """Plot color histogram for an image"""
         colors = ('r', 'g', 'b')
         
-        plt.figure(figsize=(10, 4))
+        fig, ax = plt.subplots(figsize=(10, 4))
         
         for i, color in enumerate(colors):
             hist = cv2.calcHist([image], [i], None, [256], [0, 256])
-            plt.plot(hist, color=color, alpha=0.6)
+            ax.plot(hist, color=color, alpha=0.6)
             
-        plt.title(title)
-        plt.xlabel('Pixel Intensity')
-        plt.ylabel('Count')
-        plt.grid(True, alpha=0.2)
-        plt.show()
+        ax.set_title(title)
+        ax.set_xlabel('Pixel Intensity')
+        ax.set_ylabel('Count')
+        ax.grid(True, alpha=0.2)
+        return fig
 
     def analyze_image(self, image, title="Image Analysis"):
         """Perform comprehensive image analysis"""
@@ -388,7 +265,7 @@ class ImageQualityComparator:
         
         # Create subplots
         fig, axes = plt.subplots(3, 4, figsize=(20, 12))
-        plt.suptitle(title, fontsize=16)
+        fig.suptitle(title, fontsize=16)
         
         # Original Image
         axes[0,0].imshow(image)
@@ -398,7 +275,7 @@ class ImageQualityComparator:
         # RGB Channels
         for i, c in enumerate(['Red', 'Green', 'Blue']):
             axes[0,1].plot(cv2.calcHist([image], [i], None, [256], [0, 256]), 
-                        color=c.lower(), alpha=0.6, label=c)
+                          color=c.lower(), alpha=0.6, label=c)
         axes[0,1].set_title('RGB Histogram')
         axes[0,1].legend()
         axes[0,1].grid(True, alpha=0.2)
@@ -436,190 +313,135 @@ class ImageQualityComparator:
         axes[2,3].grid(True, alpha=0.2)
         
         plt.tight_layout()
-        plt.show()
+        return fig
 
-    def process_and_analyze(self, method="all"):
-        """Process image with different methods and show analysis"""
-        if method == "all":
-            methods = ["basic", "hist_global", "hist_adaptive", "hist_contrast_limited", 
-                    "gamma_correction", "contrast", "sharpen"]
-        else:
-            methods = [method]
+    def evaluate_quality(self, reference, test_image):
+        """Calculate various quality metrics"""
+        reference = np.asarray(reference, dtype=np.uint8)
+        test_image = np.asarray(test_image, dtype=np.uint8)
         
-        # Create figure for processed images
-        n_methods = len(methods)
-        fig_rows = (n_methods + 2) // 3  # +2 for original image
-        fig, axes = plt.subplots(fig_rows, 3, figsize=(15, 5*fig_rows))
-        axes = axes.ravel()
-        
-        # Plot original image
-        axes[0].imshow(self.degraded_image)
-        axes[0].set_title('Original Image')
-        axes[0].axis('off')
-        
-        # Process and plot each method
-        for i, method in enumerate(methods, 1):
-            processed = self.process_image(self.degraded_image, method=method)
-            axes[i].imshow(processed)
-            axes[i].set_title(f'{method.replace("_", " ").title()}')
-            axes[i].axis('off')
+        reference_gray = cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)
+        test_gray = cv2.cvtColor(test_image, cv2.COLOR_RGB2GRAY)
             
-            # Analyze original and processed images
-            print(f"\n=== Analysis for {method.replace('_', ' ').title()} ===")
-            self.analyze_image(processed, title=f"Analysis for {method.replace('_', ' ').title()}")
-        
-        plt.tight_layout()
-        plt.show()
+        metrics = {
+            'PSNR': self.calculate_psnr(reference, test_image),
+            'SSIM': ssim(reference_gray, test_gray, data_range=255),
+            'MSE': np.mean((reference.astype(float) - test_image.astype(float)) ** 2),
+            'MAE': np.mean(np.abs(reference.astype(float) - test_image.astype(float)))
+        }
+        return metrics
+
+    def calculate_psnr(self, reference, test_image):
+        """Calculate PSNR"""
+        mse = np.mean((reference.astype(float) - test_image.astype(float)) ** 2)
+        if mse == 0:
+            return float('inf')
+        max_pixel = 255.0
+        psnr = 20 * log10(max_pixel / sqrt(mse))
+        return psnr
 
 def main():
     st.set_page_config(layout="wide", page_title="Image Quality Enhancement & Analysis")
     
     st.title("Image Quality Enhancement & Analysis Tool")
     
-    # File uploaders in a row
+    comparator = ImageQualityComparator()
+    
+    # File uploaders
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Upload Reference Image")
-        reference_file = st.file_uploader("Choose reference image", type=['jpg', 'jpeg', 'png'])
-    
+        reference_file = st.file_uploader("Upload Reference Image", type=['jpg', 'jpeg', 'png'])
     with col2:
-        st.subheader("Upload Test Image")
-        test_file = st.file_uploader("Choose test image", type=['jpg', 'jpeg', 'png'])
+        test_file = st.file_uploader("Upload Test Image", type=['jpg', 'jpeg', 'png'])
     
-    if reference_file is not None and test_file is not None:
-        # Create temporary files
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as ref_tmp:
-            ref_tmp.write(reference_file.getvalue())
-            reference_path = ref_tmp.name
+    if reference_file and test_file:
+        try:
+            # Load images
+            reference_img, test_img = comparator.load_images(reference_file, test_file)
             
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as test_tmp:
-            test_tmp.write(test_file.getvalue())
-            test_path = test_tmp.name
-        
-        # Initialize comparator
-        comparator = ImageQualityComparator()
-        comparator.load_images(reference_path, test_path)
-        
-        # Display original images
-        st.header("Input Images")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(comparator.reference_image, caption="Reference Image")
-        with col2:
-            st.image(comparator.degraded_image, caption="Test Image")
-        
-        # Processing methods selection
-        st.header("Image Enhancement")
-        processing_methods = ["basic", "contrast", "sharpen", "combined", "contrast_sharp", 
-                            "hist_global", "hist_adaptive", "hist_contrast_limited", "gamma_correction"]
-        
-        selected_methods = st.multiselect(
-            "Select processing methods to compare",
-            processing_methods,
-            default=["contrast_sharp"]
-        )
-        
-        if selected_methods:
-            # Process images and store results
-            all_metrics = {}
-            all_improvements = {}
-            processed_images = {}
+            # Display original images
+            st.header("Input Images")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.image(reference_img, caption="Reference Image")
+                st.pyplot(comparator.plot_histogram(reference_img, "Reference Histogram"))
+            with col2:
+                st.image(test_img, caption="Test Image")
+                st.pyplot(comparator.plot_histogram(test_img, "Test Histogram"))
             
-            for method in selected_methods:
-                with st.expander(f"{method.replace('_', ' ').title()} Method Results"):
-                    # Process image and get metrics
-                    processed_image, degraded_metrics, processed_metrics, improvements = (
-                        comparator.compare_improvements(processing_method=method)
-                    )
+            # Image analysis
+            st.header("Image Analysis")
+            st.pyplot(comparator.analyze_image(test_img, "Test Image Analysis"))
+            
+            # Processing methods selection
+            st.header("Image Enhancement")
+            methods = ["basic", "contrast", "sharpen", "combined", "contrast_sharp", 
+                      "hist_global", "hist_adaptive", "hist_contrast_limited", "gamma_correction"]
+            
+            selected_methods = st.multiselect(
+                "Select processing methods to compare",
+                methods,
+                default=["contrast_sharp"]
+            )
+            
+            if selected_methods:
+                # Process and evaluate each method
+                all_metrics = {}
+                all_improvements = {}
+                processed_images = {}
+                
+                for method in selected_methods:
+                    st.subheader(f"{method.replace('_', ' ').title()} Method")
                     
-                    # Store results
-                    all_metrics[method] = processed_metrics
-                    all_improvements[method] = improvements
-                    processed_images[method] = processed_image
+                    # Process image
+                    processed = comparator.process_image(test_img, method=method)
+                    processed_images[method] = processed
                     
-                    # Display processed image
-                    st.image(processed_image, caption=f"Processed Image ({method})")
-                    
-                    # Display metrics
+                    # Display results
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.subheader("Quality Metrics")
-                        metrics_df = pd.DataFrame({
-                            'Metric': list(processed_metrics.keys()),
-                            'Value': list(processed_metrics.values())
-                        })
-                        st.table(metrics_df)
-                    
+                        st.image(processed, caption=f"Processed Image ({method})")
                     with col2:
-                        st.subheader("Improvements")
-                        improvements_df = pd.DataFrame({
-                            'Metric': list(improvements.keys()),
-                            'Improvement (%)': [f"{v:+.2f}%" for v in improvements.values()]
-                        })
-                        st.table(improvements_df)
+                        st.pyplot(comparator.plot_histogram(processed, f"{method} Histogram"))
                     
-                    # Histogram Analysis
-                    st.subheader("Histogram Analysis")
-                    comparator.analyze_image(processed_image)
-                    st.pyplot(plt)
+                    # Calculate metrics
+                    metrics = comparator.evaluate_quality(reference_img, processed)
+                    all_metrics[method] = metrics
                     
-                    # Segmentation Analysis
-                    st.subheader("Segmentation Analysis")
-                    processed_segments = comparator.segment_objects(processed_image)
-                    comparator.segmentation_masks = processed_segments
+                    # Display metrics
+                    metrics_df = pd.DataFrame({
+                        'Metric': metrics.keys(),
+                        'Value': [f"{v:.4f}" for v in metrics.values()]
+                    })
+                    st.table(metrics_df)
+                    
+                    # Segmentation analysis
+                    st.subheader(f"Segmentation Analysis for {method}")
+                    segments = comparator.segment_objects(processed)
+                    comparator.segmentation_masks = segments
                     comparator.visualize_segmentation()
-                    st.pyplot(plt)
-            
-            # Comparative Analysis
-            st.header("Comparative Analysis")
-            
-            # Metrics comparison table
-            metrics = ['PSNR', 'SSIM', 'MSE', 'MAE']
-            comparison_data = []
-            for method in selected_methods:
-                row = {'Method': method}
-                row.update({metric: all_metrics[method][metric] for metric in metrics})
-                comparison_data.append(row)
-            
-            comparison_df = pd.DataFrame(comparison_data)
-            st.subheader("Quality Metrics Comparison")
-            st.table(comparison_df)
-            
-            # Improvements comparison
-            st.subheader("Improvements Comparison")
-            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-            axes = axes.ravel()
-            
-            for idx, metric in enumerate(metrics):
-                improvements = [all_improvements[method][metric] for method in selected_methods]
                 
-                axes[idx].bar(selected_methods, improvements)
-                axes[idx].set_title(f'{metric} Improvement')
-                axes[idx].set_ylabel('Percentage Improvement')
-                axes[idx].tick_params(axis='x', rotation=45)
+                # Comparative analysis
+                st.header("Comparative Analysis")
+                metrics_comparison = pd.DataFrame(all_metrics).round(4)
+                st.table(metrics_comparison)
                 
-                # Add value labels on bars
-                for i, v in enumerate(improvements):
-                    axes[idx].text(i, v, f'{v:.1f}%', ha='center', va='bottom')
+                # Plot comparative metrics
+                fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+                axes = axes.ravel()
+                metrics = ['PSNR', 'SSIM', 'MSE', 'MAE']
+                
+                for idx, metric in enumerate(metrics):
+                    values = [all_metrics[method][metric] for method in selected_methods]
+                    axes[idx].bar(selected_methods, values)
+                    axes[idx].set_title(f'{metric} Comparison')
+                    axes[idx].tick_params(axis='x', rotation=45)
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+                
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
             
-            plt.tight_layout()
-            st.pyplot(fig)
-            
-            # Best performing methods
-            st.subheader("Best Performing Methods")
-            best_methods = []
-            for metric in metrics:
-                best_method = max(selected_methods, 
-                                key=lambda x: all_improvements[x][metric])
-                improvement = all_improvements[best_method][metric]
-                best_methods.append({
-                    'Metric': metric,
-                    'Best Method': best_method,
-                    'Improvement': f"{improvement:+.2f}%"
-                })
-            
-            best_df = pd.DataFrame(best_methods)
-            st.table(best_df)
-
 if __name__ == "__main__":
     main()
